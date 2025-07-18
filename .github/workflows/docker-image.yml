@@ -1,0 +1,70 @@
+name: CI/CD Docker -> ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ECS_CLUSTER: person-cluster
+  AWS_ECS_SERVICE: person-service
+  AWS_ECS_TASK_DEFINITION_FAMILY: person-task
+  DOCKERHUB_IMAGE: aledve/person-service
+  CONTAINER_NAME: person-service
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t $DOCKERHUB_IMAGE:${{ github.sha }} .
+          docker push $DOCKERHUB_IMAGE:${{ github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: $AWS_REGION
+
+      - name: Get current Task Definition JSON
+        id: task_def
+        run: |
+          aws ecs describe-task-definition --task-definition $AWS_ECS_TASK_DEFINITION_FAMILY > task-def.json
+          echo "::set-output name=taskdef::$(cat task-def.json)"
+
+      - name: Create new Task Definition with updated image
+        id: new_task_def
+        run: |
+          NEW_TASK_DEF=$(jq --arg IMAGE "$DOCKERHUB_IMAGE:${{ github.sha }}" \
+            '.taskDefinition |
+            {family, networkMode, containerDefinitions, requiresCompatibilities, cpu, memory, executionRoleArn, taskRoleArn, volumes} |
+            .containerDefinitions[0].image = $IMAGE |
+            .' task-def.json)
+
+          echo "$NEW_TASK_DEF" > new-task-def.json
+          echo "::set-output name=json::$(cat new-task-def.json | jq -c '.')"
+
+      - name: Register new Task Definition
+        id: register_task
+        run: |
+          aws ecs register-task-definition --cli-input-json file://new-task-def.json > new-task-def-response.json
+          NEW_TASK_DEF_ARN=$(jq -r '.taskDefinition.taskDefinitionArn' new-task-def-response.json)
+          echo "::set-output name=arn::$NEW_TASK_DEF_ARN"
+
+      - name: Update ECS Service to use new Task Definition
+        run: |
+          aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE --task-definition ${{ steps.register_task.outputs.arn }} --force-new-deployment
